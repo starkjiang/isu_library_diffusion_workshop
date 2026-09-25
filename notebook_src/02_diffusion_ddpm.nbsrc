@@ -1,0 +1,326 @@
+#%% md
+# Lab 2 · Diffusion models: forward noise, a time-aware U-Net, reverse sampling
+
+{{BADGE}}
+
+**Time:** about 45 minutes
+
+In Lab 1 a U-Net could repair a noisy picture but could not create one from scratch. Now we add the three missing ideas:
+
+1. a **forward diffusion** function `q` that adds noise in many small, scheduled steps,
+2. a U-Net that is told the **timestep** `t` (how noisy is my input?) and predicts the **noise** rather than the image,
+3. a **reverse diffusion** function that removes the predicted noise one step at a time, from `t = T` down to `t = 0`.
+
+#%% setup
+
+#%% code
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+from diffusion_workshop.data import get_fashion_mnist
+from diffusion_workshop.viz import show_images, show_rows, plot_losses, animate
+
+IMG_SIZE, IMG_CH = 16, 1
+dataset, loader = get_fashion_mnist(img_size=IMG_SIZE, batch_size=128)
+images, _ = next(iter(loader))
+
+#%% md
+## 1 · The noise schedule
+
+At every step `t` we add a little Gaussian noise with variance **β<sub>t</sub>** (beta). Early steps add very little, later steps add more.
+
+| symbol | code | meaning |
+|---|---|---|
+| β<sub>t</sub> | `B[t]` | how much noise step `t` adds |
+| α<sub>t</sub> = 1 − β<sub>t</sub> | `a[t]` | how much of the previous image step `t` keeps |
+| ᾱ<sub>t</sub> = α<sub>1</sub>·α<sub>2</sub>·…·α<sub>t</sub> | `a_bar[t]` | how much of the **original** image is left after `t` steps |
+
+### TODO 1 · Compute `a` and `a_bar`
+
+Hint: `torch.cumprod(x, dim=0)` returns the running product of `x`.
+
+#%% code
+T = pick(300, smoke=20)                      # number of diffusion steps
+B = torch.linspace(1e-4, 0.03, T, device=device)
+
+### BEGIN SOLUTION
+a = 1.0 - B
+a_bar = torch.cumprod(a, dim=0)
+### END SOLUTION
+### STUDENT: a = FIXME
+### STUDENT: a_bar = FIXME
+
+sqrt_a_bar = a_bar.sqrt()                    # weight on the clean image
+sqrt_one_minus_a_bar = (1 - a_bar).sqrt()    # weight on the noise
+
+plt.figure(figsize=(6, 3))
+plt.plot(sqrt_a_bar.cpu(), label="weight on the image  √ᾱ")
+plt.plot(sqrt_one_minus_a_bar.cpu(), label="weight on the noise  √(1−ᾱ)")
+plt.xlabel("timestep t"); plt.legend(); plt.show()
+
+#%% code
+# ✅ check
+assert torch.allclose(a, 1 - B) and a_bar.shape == (T,), "a should be 1 - B"
+assert torch.allclose(a_bar[1], a[0] * a[1]), "a_bar should be the running product of a"
+print(f"✅ TODO 1 looks good. At t = T-1 only {sqrt_a_bar[-1].item():.0%} of the image is left.")
+
+#%% md
+## 2 · Forward diffusion `q`
+
+We never have to loop through the steps to make a noisy image. A handy property of Gaussians lets us **jump directly** from the clean image x₀ to any timestep:
+
+$$x_t = \sqrt{\bar\alpha_t}\; x_0 \;+\; \sqrt{1-\bar\alpha_t}\; \varepsilon \qquad \varepsilon \sim \mathcal{N}(0, I)$$
+
+### TODO 2 · Write `q`
+
+`t` holds one timestep **per image** in the batch, shape `(B,)`. Indexing with `[t, None, None, None]` picks one weight per image and reshapes it to `(B, 1, 1, 1)` so it multiplies a whole image.
+
+#%% code
+def q(x_0, t):
+    """Noise a batch of clean images to timesteps t. Returns (x_t, noise)."""
+    noise = torch.randn_like(x_0)
+    w_image = sqrt_a_bar[t, None, None, None]
+    w_noise = sqrt_one_minus_a_bar[t, None, None, None]
+    ### BEGIN SOLUTION
+    x_t = w_image * x_0 + w_noise * noise
+    ### END SOLUTION
+    ### STUDENT: x_t = FIXME
+    return x_t, noise
+
+#%% code
+# ✅ check + picture of the forward process
+_x0 = images[:1].to(device)
+_xt, _eps = q(_x0, torch.tensor([T - 1], device=device))
+assert torch.allclose(_xt, sqrt_a_bar[-1] * _x0 + sqrt_one_minus_a_bar[-1] * _eps), "check the formula"
+print("✅ TODO 2 looks good")
+
+steps = torch.linspace(0, T - 1, 8).long().to(device)
+show_images(q(_x0.repeat(8, 1, 1, 1), steps)[0], titles=[f"t={s.item()}" for s in steps],
+            suptitle="forward diffusion of one image")
+
+#%% md
+## 3 · A U-Net that knows the time
+
+The same network must handle "barely noisy" and "almost pure noise", so we tell it which one it is looking at.
+We scale `t` to [0, 1], pass it through a small MLP (`EmbedBlock`) to get one number per channel, and **add** that to the decoder's feature maps.
+
+The blocks are the ones you built in Lab 1.
+
+### TODO 3 · Add the time embeddings inside `forward`
+
+#%% code
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.MaxPool2d(2))
+    def forward(self, x):
+        return self.model(x)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(2 * in_ch, out_ch, 2, 2),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU())
+    def forward(self, x, skip):
+        return self.model(torch.cat((x, skip), dim=1))
+
+class EmbedBlock(nn.Module):
+    """(B, input_dim) -> (B, emb_dim, 1, 1): one learned number per channel."""
+    def __init__(self, input_dim, emb_dim):
+        super().__init__()
+        self.input_dim = input_dim
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, emb_dim), nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+            nn.Unflatten(1, (emb_dim, 1, 1)))
+    def forward(self, x):
+        return self.model(x.view(-1, self.input_dim))
+
+#%% code
+class TimeUNet(nn.Module):
+    def __init__(self, T, img_ch=IMG_CH, img_size=IMG_SIZE, chs=(32, 64, 128)):
+        super().__init__()
+        self.T = T
+        c0, c1, c2 = chs
+        latent = img_size // 4
+        self.down0 = nn.Sequential(nn.Conv2d(img_ch, c0, 3, padding=1), nn.BatchNorm2d(c0), nn.ReLU())
+        self.down1 = DownBlock(c0, c1)
+        self.down2 = DownBlock(c1, c2)
+        self.bottleneck = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(c2 * latent**2, c1), nn.ReLU(),
+            nn.Linear(c1, c2 * latent**2), nn.ReLU(),
+            nn.Unflatten(1, (c2, latent, latent)))
+        self.t_emb1 = EmbedBlock(1, c2)      # matches up0's channels
+        self.t_emb2 = EmbedBlock(1, c1)      # matches up1's channels
+        self.up0 = nn.Sequential(nn.Conv2d(c2, c2, 3, padding=1), nn.BatchNorm2d(c2), nn.ReLU())
+        self.up1 = UpBlock(c2, c1)
+        self.up2 = UpBlock(c1, c0)
+        self.out = nn.Sequential(
+            nn.Conv2d(2 * c0, c0, 3, padding=1), nn.BatchNorm2d(c0), nn.ReLU(),
+            nn.Conv2d(c0, img_ch, 3, padding=1))
+
+    def forward(self, x, t):
+        down0 = self.down0(x)
+        down1 = self.down1(down0)
+        down2 = self.down2(down1)
+        up0 = self.up0(self.bottleneck(down2))
+
+        t = t.float() / self.T               # scale the timestep to [0, 1]
+        t_emb1 = self.t_emb1(t)              # (B, c2, 1, 1)
+        t_emb2 = self.t_emb2(t)              # (B, c1, 1, 1)
+
+        ### BEGIN SOLUTION
+        up1 = self.up1(up0 + t_emb1, down2)
+        up2 = self.up2(up1 + t_emb2, down1)
+        ### END SOLUTION
+        ### STUDENT: up1 = self.up1(FIXME, down2)     # add t_emb1 to up0
+        ### STUDENT: up2 = self.up2(FIXME, down1)     # add t_emb2 to up1
+        return self.out(torch.cat((up2, down0), dim=1))
+
+model = TimeUNet(T).to(device)
+print(f"{sum(p.numel() for p in model.parameters()):,} trainable parameters")
+
+#%% code
+# ✅ check: the output must depend on t
+model.eval()
+with torch.no_grad():
+    _x = torch.randn(2, IMG_CH, IMG_SIZE, IMG_SIZE, device=device)
+    _e0 = model(_x, torch.zeros(2, device=device).long())
+    _e1 = model(_x, torch.full((2,), T - 1, device=device).long())
+model.train()
+assert _e0.shape == _x.shape
+assert not torch.allclose(_e0, _e1), "the prediction does not change with t - did you add the embeddings?"
+print("✅ TODO 3 looks good")
+
+#%% md
+## 4 · The loss: predict the noise
+
+Training recipe for one batch:
+
+1. take clean images x₀,
+2. pick a random timestep `t` for each image,
+3. make x<sub>t</sub> with `q` and **remember the noise** ε we used,
+4. ask the model to predict that noise from (x<sub>t</sub>, t),
+5. loss = mean squared error between predicted and true noise.
+
+### TODO 4 · Write `get_loss`
+
+#%% code
+def get_loss(model, x_0, t):
+    ### BEGIN SOLUTION
+    x_t, noise = q(x_0, t)
+    noise_pred = model(x_t, t)
+    return F.mse_loss(noise_pred, noise)
+    ### END SOLUTION
+    ### STUDENT: x_t, noise = FIXME               # forward diffusion
+    ### STUDENT: noise_pred = FIXME               # what does the model think the noise is?
+    ### STUDENT: return F.mse_loss(FIXME, FIXME)
+
+#%% code
+# ✅ check
+_l = get_loss(model, images[:8].to(device), torch.randint(0, T, (8,), device=device))
+assert _l.ndim == 0 and 0.5 < _l.item() < 2.5, "an untrained model should score a loss near 1"
+print(f"✅ TODO 4 looks good (untrained loss = {_l.item():.2f})")
+
+#%% code
+EPOCHS = pick(5, smoke=1)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+
+model.train()
+for epoch in range(EPOCHS):
+    for x_0, _ in loader:
+        x_0 = x_0.to(device)
+        t = torch.randint(0, T, (x_0.shape[0],), device=device)
+        loss = get_loss(model, x_0, t)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-100:]) / len(losses[-100:]):.4f}")
+
+plot_losses(losses, "Noise-prediction loss")
+
+#%% md
+## 5 · Reverse diffusion
+
+Given x<sub>t</sub> and the model's noise estimate ε̂, one reverse step is
+
+$$x_{t-1} = \underbrace{\frac{1}{\sqrt{\alpha_t}}\Big(x_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\;\hat\varepsilon\Big)}_{\text{remove a little of the predicted noise}} \;+\; \underbrace{\sqrt{\beta_t}\; z}_{\text{add a little fresh noise}} \qquad z \sim \mathcal{N}(0, I)$$
+
+The fresh noise keeps samples varied. At the very last step (`t = 0`) we leave it out.
+
+### TODO 5 · Write `reverse_q`
+
+#%% code
+sqrt_a_inv = (1 / a).sqrt()
+pred_noise_coeff = (1 - a) / (1 - a_bar).sqrt()
+
+@torch.no_grad()
+def reverse_q(x_t, t, e_t):
+    """One step x_t -> x_(t-1). t is a plain Python int, e_t the predicted noise."""
+    ### BEGIN SOLUTION
+    u_t = sqrt_a_inv[t] * (x_t - pred_noise_coeff[t] * e_t)
+    ### END SOLUTION
+    ### STUDENT: u_t = FIXME * (x_t - FIXME * e_t)
+    if t == 0:
+        return u_t
+    return u_t + B[t].sqrt() * torch.randn_like(x_t)
+
+#%% code
+# ✅ check: if we feed reverse_q the TRUE noise, the very first step must recover the image exactly
+_x0 = images[:4].to(device)
+_x1, _eps = q(_x0, torch.zeros(4, device=device).long())
+assert torch.allclose(reverse_q(_x1, 0, _eps), _x0, atol=1e-4), "check the two coefficients"
+print("✅ TODO 5 looks good")
+
+#%% md
+## 6 · Generate!
+
+Start from pure noise and walk **backwards** from `t = T-1` to `t = 0`.
+
+### TODO 6 · Complete the sampling loop
+
+#%% code
+@torch.no_grad()
+def sample(model, n=16, keep_every=None):
+    model.eval()
+    x_t = torch.randn(n, IMG_CH, IMG_SIZE, IMG_SIZE, device=device)
+    frames = []
+    for t in range(T - 1, -1, -1):
+        t_batch = torch.full((n,), t, device=device, dtype=torch.long)
+        ### BEGIN SOLUTION
+        e_t = model(x_t, t_batch)
+        x_t = reverse_q(x_t, t, e_t)
+        ### END SOLUTION
+        ### STUDENT: e_t = FIXME                  # predict the noise in x_t
+        ### STUDENT: x_t = FIXME                  # take one reverse step
+        if keep_every and t % keep_every == 0:
+            frames.append(x_t[0].cpu())
+    model.train()
+    return x_t, frames
+
+generated, frames = sample(model, n=16, keep_every=max(T // 30, 1))
+show_images(generated, suptitle="Generated from pure noise")
+
+#%% code
+animate(frames)   # watch one sample appear out of the noise
+
+#%% md
+## What to notice
+
+* These are **new** images: nothing was copied from the dataset, and every run gives different results.
+* Compare with the gray blobs at the end of Lab 1. Same U-Net idea, but now trained on *every* noise level and used in many small steps.
+* Look closely and you will probably see **speckles or checkerboard patterns**. Lab 3 fixes those.
+
+### If you have time
+1. Set `T = 50` and retrain. Then try `T = 600`. What changes in quality and in sampling time?
+2. In `reverse_q`, remove the fresh noise (always return `u_t`). What happens to the variety of the samples?
+3. Change the schedule's end value from `0.03` to `0.005`. Plot the schedule: is the image fully destroyed by `t = T`? How do the samples look?

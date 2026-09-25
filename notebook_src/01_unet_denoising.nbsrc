@@ -1,0 +1,242 @@
+#%% md
+# Lab 1 · From U-Net to diffusion: build a U-Net and teach it to remove noise
+
+{{BADGE}}
+
+**Time:** about 35 minutes
+
+**You will**
+1. build the pieces of a **U-Net** (down block, up block, skip connections),
+2. train it to **remove noise** from clothing images,
+3. try to **generate** brand-new images from pure noise, and see why that is not enough yet.
+
+Cells marked **TODO** contain `FIXME`. Replace each one, then run the ✅ check below it.
+
+#%% setup
+
+#%% code
+import torch.nn as nn
+import torch.nn.functional as F
+
+from diffusion_workshop.data import get_fashion_mnist
+from diffusion_workshop.viz import show_images, show_rows, plot_losses
+
+IMG_SIZE, IMG_CH = 16, 1
+dataset, loader = get_fashion_mnist(img_size=IMG_SIZE, batch_size=128)
+images, _ = next(iter(loader))
+show_images(images[:16], suptitle="Training data: FashionMNIST at 16x16")
+
+#%% md
+## 1 · The task: noisy image in, clean image out
+
+We mix each image with Gaussian noise. `amount = 0` is the clean image, `amount = 1` is pure noise.
+
+### TODO 1 · Write `add_noise`
+
+Blend the image and the noise: keep `(1 - amount)` of the image and add `amount` of the noise.
+
+#%% code
+def add_noise(imgs, amount=0.5):
+    noise = torch.randn_like(imgs)
+    ### BEGIN SOLUTION
+    return (1 - amount) * imgs + amount * noise
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+show_rows([images[:8], add_noise(images[:8], 0.25), add_noise(images[:8], 0.5), add_noise(images[:8], 1.0)],
+          ["clean", "amount 0.25", "amount 0.5", "amount 1.0"])
+
+#%% code
+# ✅ check
+_x = torch.ones(2, 1, 4, 4)
+assert torch.allclose(add_noise(_x, 0.0), _x), "amount=0 must return the clean image"
+assert not torch.allclose(add_noise(_x, 1.0), _x) and abs(add_noise(torch.ones(64, 1, 16, 16), 1.0).mean()) < 0.1, \
+    "amount=1 must return pure noise"
+print("✅ TODO 1 looks good")
+
+#%% md
+## 2 · U-Net building blocks
+
+A U-Net has two halves:
+
+* the **encoder** (going *down*) shrinks the image and grows the number of channels: "what is in this picture?"
+* the **decoder** (going *up*) grows the image back to full size: "draw it again, cleanly."
+
+**Skip connections** hand each decoder stage the matching encoder features, so fine detail that was lost while shrinking can be recovered.
+
+```
+x ─► down0 ─► down1 ─► down2 ─► bottleneck ─► up0 ─► up1 ─► up2 ─► out
+       │         │        └────────── skip ─────────────┘      │      ▲
+       │         └────────────────── skip ─────────────────────┘      │
+       └──────────────────────────── skip ────────────────────────────┘
+```
+
+#%% code
+class DownBlock(nn.Module):
+    """(B, in_ch, H, W) -> (B, out_ch, H/2, W/2)"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+print(tuple(DownBlock(1, 32)(images[:4]).shape), "<- half the size, 32 channels")
+
+#%% md
+### TODO 2 · Finish the up block
+
+The up block receives `x` (from the layer below) **and** `skip` (from the encoder, same shape as `x`).
+Concatenate them along the **channel** axis (`dim=1`) before running the layers. That is why the first layer expects `2 * in_ch` channels.
+
+#%% code
+class UpBlock(nn.Module):
+    """x and skip are both (B, in_ch, H, W) -> (B, out_ch, 2H, 2W)"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(2 * in_ch, out_ch, kernel_size=2, stride=2),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(),
+        )
+
+    def forward(self, x, skip):
+        ### BEGIN SOLUTION
+        x = torch.cat((x, skip), dim=1)
+        ### END SOLUTION
+        ### STUDENT: x = FIXME
+        return self.model(x)
+
+#%% code
+# ✅ check
+_out = UpBlock(64, 32)(torch.randn(4, 64, 4, 4), torch.randn(4, 64, 4, 4))
+assert tuple(_out.shape) == (4, 32, 8, 8), f"got {tuple(_out.shape)}, wanted (4, 32, 8, 8)"
+print("✅ TODO 2 looks good")
+
+#%% md
+### TODO 3 · Wire up the U-Net
+
+Everything in `__init__` is given. In `forward`, connect the decoder: each `up` block takes the output of the stage before it **and** the encoder feature map of the same size.
+
+| tensor | shape for a 16×16 input |
+|---|---|
+| `down0` | (B, 32, 16, 16) |
+| `down1` | (B, 32, 8, 8) |
+| `down2` | (B, 64, 4, 4) |
+| `up0` | (B, 64, 4, 4) |
+
+#%% code
+class UNet(nn.Module):
+    def __init__(self, img_ch=IMG_CH, img_size=IMG_SIZE, chs=(32, 32, 64)):
+        super().__init__()
+        c0, c1, c2 = chs
+        latent = img_size // 4
+        self.down0 = nn.Sequential(nn.Conv2d(img_ch, c0, 3, padding=1), nn.BatchNorm2d(c0), nn.ReLU())
+        self.down1 = DownBlock(c0, c1)
+        self.down2 = DownBlock(c1, c2)
+        # bottleneck: squeeze the whole picture through a small vector and back
+        self.bottleneck = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(c2 * latent**2, c1), nn.ReLU(),
+            nn.Linear(c1, c2 * latent**2), nn.ReLU(),
+            nn.Unflatten(1, (c2, latent, latent)),
+        )
+        self.up0 = nn.Sequential(nn.Conv2d(c2, c2, 3, padding=1), nn.BatchNorm2d(c2), nn.ReLU())
+        self.up1 = UpBlock(c2, c1)
+        self.up2 = UpBlock(c1, c0)
+        self.out = nn.Sequential(
+            nn.Conv2d(2 * c0, c0, 3, padding=1), nn.BatchNorm2d(c0), nn.ReLU(),
+            nn.Conv2d(c0, img_ch, 3, padding=1),
+        )
+
+    def forward(self, x):
+        down0 = self.down0(x)
+        down1 = self.down1(down0)
+        down2 = self.down2(down1)
+        up0 = self.up0(self.bottleneck(down2))
+        ### BEGIN SOLUTION
+        up1 = self.up1(up0, down2)
+        up2 = self.up2(up1, down1)
+        ### END SOLUTION
+        ### STUDENT: up1 = self.up1(FIXME, FIXME)
+        ### STUDENT: up2 = self.up2(FIXME, FIXME)
+        return self.out(torch.cat((up2, down0), dim=1))
+
+model = UNet().to(device)
+print(f"{sum(p.numel() for p in model.parameters()):,} trainable parameters")
+
+#%% code
+# ✅ check
+assert model(images[:4].to(device)).shape == images[:4].shape, "output must have the same shape as the input"
+print("✅ TODO 3 looks good: image in, image out")
+
+#%% md
+## 3 · Train it to denoise
+
+Input: a noisy image. Target: the clean image. Loss: mean squared error between the two.
+
+#%% code
+EPOCHS = pick(3, smoke=1)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+
+model.train()
+for epoch in range(EPOCHS):
+    for clean, _ in loader:
+        clean = clean.to(device)
+        noisy = add_noise(clean, amount=0.5)
+        loss = F.mse_loss(model(noisy), clean)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-100:]) / len(losses[-100:]):.4f}")
+
+plot_losses(losses, "Denoising loss")
+
+#%% code
+model.eval()
+with torch.no_grad():
+    clean = images[:8].to(device)
+    noisy = add_noise(clean, 0.5)
+    denoised = model(noisy)
+show_rows([clean, noisy, denoised], ["clean", "noisy (input)", "denoised (output)"])
+
+#%% md
+The U-Net has learned what clothes look like well enough to repair a half-noisy picture.
+
+## 4 · Can it *generate*?
+
+If it can remove noise, what happens when we hand it **pure noise**, with no picture underneath?
+
+#%% code
+with torch.no_grad():
+    pure_noise = torch.randn(16, IMG_CH, IMG_SIZE, IMG_SIZE, device=device)
+    one_shot = model(pure_noise)
+
+    # second idea: denoise a little, feed the result back in, repeat
+    x = pure_noise.clone()
+    for _ in range(10):
+        x = 0.7 * x + 0.3 * model(x)
+
+show_images(one_shot, suptitle="one pass on pure noise")
+show_images(x, suptitle="ten small passes")
+
+#%% md
+### What went wrong?
+
+* The model was only ever shown images that were **half** noise. Pure noise is outside anything it was trained on.
+* With MSE loss, when many answers are possible the safest prediction is their **average**, which is a gray blob.
+* One giant leap from noise to image is too hard. Many **small** steps are easier, *if* the model knows how noisy its input is at each step.
+
+Those three fixes are exactly what a **diffusion model** adds. That is Lab 2.
+
+### If you have time
+1. Train with a random `amount` per batch (`amount = torch.rand(1).item()`). Does generation from pure noise improve?
+2. Remove the skip connections (pass `torch.zeros_like(skip)` instead) and retrain. What happens to fine detail?
+3. Change `chs=(32, 32, 64)` to something smaller or larger. How do the loss and the training time react?

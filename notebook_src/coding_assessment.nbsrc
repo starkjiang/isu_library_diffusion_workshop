@@ -1,0 +1,264 @@
+#%% md
+# Coding assessment · Generate handwritten digits on demand
+
+{{BADGE}}
+
+**Time:** 35 minutes · **Open book:** you may look at your lab notebooks and the slides.
+
+### The task
+Build a classifier-free-guided diffusion model that draws the MNIST digit you ask for. The U-Net, data loading and plotting are provided. **You write the diffusion logic**: five short TODOs, each one something you did in Labs 2–4.
+
+### How it is graded
+At the end, your model generates 10 images of every digit 0–9. A separate, ordinary digit classifier (trained in this notebook, about 99% accurate on real digits) then reads your 100 images.
+
+| Result | Meaning |
+|---|---|
+| all five ✅ checks pass | 50 points (10 each) |
+| classifier agrees with the requested digit on **≥ 90%** of images | + 40 points |
+| written answers in the last cell | + 10 points |
+| **Pass mark** | **70 points** |
+
+Replace every `FIXME`. Do not change the ✅ check cells.
+
+#%% setup
+
+#%% code
+import torch.nn as nn
+import torch.nn.functional as F
+
+from diffusion_workshop.data import get_mnist
+from diffusion_workshop.models import UNet
+from diffusion_workshop.viz import show_images, plot_losses
+
+IMG_SIZE, IMG_CH, N_CLASSES = 28, 1, 10
+T = pick(300, smoke=20)
+dataset, loader = get_mnist(img_size=IMG_SIZE, batch_size=128, train=True)
+images, labels = next(iter(loader))
+show_images(images[:16], titles=labels[:16].tolist())
+
+points = 0
+
+#%% md
+## TODO 1 · Noise schedule (10 points)
+From the betas `B`, compute `a` (alpha), `a_bar` (cumulative product of alpha) and the two weights used by forward diffusion.
+
+#%% code
+B = torch.linspace(1e-4, 0.03, T, device=device)
+
+### BEGIN SOLUTION
+a = 1.0 - B
+a_bar = torch.cumprod(a, dim=0)
+sqrt_a_bar = a_bar.sqrt()
+sqrt_one_minus_a_bar = (1 - a_bar).sqrt()
+### END SOLUTION
+### STUDENT: a = FIXME
+### STUDENT: a_bar = FIXME
+### STUDENT: sqrt_a_bar = FIXME               # weight on the clean image
+### STUDENT: sqrt_one_minus_a_bar = FIXME     # weight on the noise
+
+sqrt_a_inv = (1 / a).sqrt()
+pred_noise_coeff = (1 - a) / (1 - a_bar).sqrt()
+
+#%% code
+# ✅ check 1
+assert torch.allclose(a_bar[2], (1 - B[0]) * (1 - B[1]) * (1 - B[2]))
+assert torch.allclose(sqrt_a_bar**2 + sqrt_one_minus_a_bar**2, torch.ones(T, device=device), atol=1e-5)
+points += 10; print("✅ check 1 passed |", points, "points")
+
+#%% md
+## TODO 2 · Forward diffusion `q` (10 points)
+Return the noised images `x_t` **and** the noise that was used.
+
+#%% code
+def q(x_0, t):
+    noise = torch.randn_like(x_0)
+    ### BEGIN SOLUTION
+    x_t = sqrt_a_bar[t, None, None, None] * x_0 + sqrt_one_minus_a_bar[t, None, None, None] * noise
+    ### END SOLUTION
+    ### STUDENT: x_t = FIXME
+    return x_t, noise
+
+#%% code
+# ✅ check 2
+_x0 = images[:8].to(device); _t = torch.randint(0, T, (8,), device=device)
+_xt, _n = q(_x0, _t)
+assert torch.allclose((_xt - sqrt_one_minus_a_bar[_t, None, None, None] * _n) / sqrt_a_bar[_t, None, None, None], _x0, atol=1e-3)
+points += 10; print("✅ check 2 passed |", points, "points")
+
+#%% md
+## TODO 3 · Context and Bernoulli mask (10 points)
+* `to_context`: one-hot encode the labels as floats, shape `(B, 10)`.
+* `get_context_mask`: shape `(B, 1)`, each entry 1 with probability `1 - drop_prob`, else 0.
+
+#%% code
+def to_context(labels):
+    ### BEGIN SOLUTION
+    return F.one_hot(labels, N_CLASSES).float()
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+def get_context_mask(c, drop_prob):
+    ### BEGIN SOLUTION
+    return torch.bernoulli(torch.full((c.shape[0], 1), 1.0 - drop_prob, device=c.device))
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+#%% code
+# ✅ check 3
+_c = to_context(torch.arange(10).repeat(500))
+_m = get_context_mask(_c, 0.2)
+assert _c.dtype == torch.float32 and tuple(_c.shape) == (5000, 10) and torch.equal(_c[:10], torch.eye(10))
+assert tuple(_m.shape) == (5000, 1) and set(_m.unique().tolist()) <= {0.0, 1.0} and 0.77 < _m.mean() < 0.83
+points += 10; print("✅ check 3 passed |", points, "points")
+
+#%% md
+## TODO 4 · Loss (10 points)
+Noise the images, let the model predict the noise from `(x_t, t, c, c_mask)`, and return the mean squared error.
+
+#%% code
+def get_loss(model, x_0, t, c, c_mask):
+    ### BEGIN SOLUTION
+    x_t, noise = q(x_0, t)
+    return F.mse_loss(model(x_t, t, c, c_mask), noise)
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+model = UNet(T, img_ch=IMG_CH, img_size=IMG_SIZE, down_chs=(64, 64, 128), c_embed_dim=N_CLASSES).to(device)
+
+#%% code
+# ✅ check 4
+_c = to_context(labels[:8].to(device))
+_l = get_loss(model, images[:8].to(device), torch.randint(0, T, (8,), device=device), _c, get_context_mask(_c, 0.1))
+assert _l.ndim == 0 and _l.requires_grad and 0.3 < _l.item() < 3.0
+points += 10; print("✅ check 4 passed |", points, "points")
+
+#%% md
+## Train (provided)
+About five epochs is enough. While it runs, start on TODO 5.
+
+#%% code
+EPOCHS = pick(5, smoke=1)
+DROP_PROB = 0.1
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+
+model.train()
+for epoch in range(EPOCHS):
+    for x_0, y in loader:
+        x_0, y = x_0.to(device), y.to(device)
+        t = torch.randint(0, T, (x_0.shape[0],), device=device)
+        c = to_context(y)
+        loss = get_loss(model, x_0, t, c, get_context_mask(c, DROP_PROB))
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        losses.append(loss.item())
+    print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-100:]) / len(losses[-100:]):.4f}")
+plot_losses(losses)
+
+#%% md
+## TODO 5 · Guided reverse diffusion (10 points)
+Fill in (a) the reverse step and (b) the classifier-free guidance combination.
+
+#%% code
+@torch.no_grad()
+def reverse_q(x_t, t, e_t):
+    ### BEGIN SOLUTION
+    u_t = sqrt_a_inv[t] * (x_t - pred_noise_coeff[t] * e_t)
+    ### END SOLUTION
+    ### STUDENT: u_t = FIXME
+    if t == 0:
+        return u_t
+    return u_t + B[t].sqrt() * torch.randn_like(x_t)
+
+@torch.no_grad()
+def sample_w(model, c, w):
+    model.eval()
+    n = c.shape[0]
+    x_t = torch.randn(n, IMG_CH, IMG_SIZE, IMG_SIZE, device=device)
+    c_double = c.repeat(2, 1)
+    c_mask = torch.ones(2 * n, 1, device=device); c_mask[n:] = 0.0
+    for t in range(T - 1, -1, -1):
+        t_batch = torch.full((2 * n,), t, device=device, dtype=torch.long)
+        e = model(x_t.repeat(2, 1, 1, 1), t_batch, c_double, c_mask)
+        e_keep, e_drop = e[:n], e[n:]
+        ### BEGIN SOLUTION
+        e_t = (1 + w) * e_keep - w * e_drop
+        ### END SOLUTION
+        ### STUDENT: e_t = FIXME
+        x_t = reverse_q(x_t, t, e_t)
+    model.train()
+    return x_t
+
+#%% code
+# ✅ check 5
+from diffusion_workshop.ddpm import DDPM
+_ref = DDPM(T=T, beta_end=0.03, device=device)
+_x = torch.randn(4, IMG_CH, IMG_SIZE, IMG_SIZE, device=device); _e = torch.randn_like(_x)
+assert torch.allclose(reverse_q(_x, 0, _e), _ref.reverse_q(_x, 0, _e), atol=1e-5), "reverse step is off"
+_c = to_context(torch.arange(4, device=device))
+torch.manual_seed(3); _mine = sample_w(model, _c, 1.0)
+torch.manual_seed(3); _theirs = _ref.sample_w(model, _c, (IMG_CH, IMG_SIZE, IMG_SIZE), w=1.0)
+assert torch.allclose(_mine, _theirs, atol=1e-3), "guidance combination is off"
+points += 10; print("✅ check 5 passed |", points, "points")
+
+#%% md
+## Generate and grade (40 points)
+Choose your guidance weight `W`, then run the three cells below. You may re-run with a different `W` (or train longer) as often as time allows.
+
+#%% code
+W = 2.0      # <- your choice
+
+requested = torch.arange(N_CLASSES, device=device).repeat_interleave(10)      # 10 of every digit
+generated = sample_w(model, to_context(requested), W)
+show_images(generated, ncols=10, scale=0.9, suptitle=f"row = digit 0 … 9   (w = {W})")
+
+#%% code
+# The grader: a plain CNN digit classifier trained on real MNIST (provided, do not edit)
+grader = nn.Sequential(
+    nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+    nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+    nn.Flatten(), nn.Linear(64 * 7 * 7, 128), nn.ReLU(), nn.Linear(128, 10)).to(device)
+g_opt = torch.optim.Adam(grader.parameters(), lr=1e-3)
+for _ in range(pick(2, smoke=1)):
+    for x, y in loader:
+        g_loss = F.cross_entropy(grader(x.to(device)), y.to(device))
+        g_opt.zero_grad(); g_loss.backward(); g_opt.step()
+
+grader.eval()
+_, test_loader = get_mnist(img_size=IMG_SIZE, batch_size=1000, train=False)
+with torch.no_grad():
+    real_acc = torch.cat([(grader(x.to(device)).argmax(1).cpu() == y) for x, y in test_loader]).float().mean().item()
+print(f"grader accuracy on real test digits: {real_acc:.1%}")
+
+#%% code
+with torch.no_grad():
+    read_as = grader(generated.clamp(-1, 1)).argmax(1)
+gen_acc = (read_as == requested).float().mean().item()
+print(f"the grader read {gen_acc:.0%} of your generated digits as the digit you asked for")
+for d in range(N_CLASSES):
+    print(f"  digit {d}: {(read_as[requested == d] == d).float().mean().item():.0%}")
+
+if gen_acc >= 0.90 or dw.SMOKE:
+    points += 40
+    print("\n✅ generation target reached")
+else:
+    print("\n❌ below 90%. Ideas: raise W, train a few more epochs, check TODO 5.")
+print("points so far:", points, "/ 90")
+
+#%% md
+## Written answers (10 points, graded by the instructor)
+Double-click and answer in one or two sentences each.
+
+1. **Why does the model predict the *noise* instead of the clean image?**
+
+   *your answer*
+
+2. **What would go wrong at sampling time if `DROP_PROB` were 0 during training?**
+
+   *your answer*
+
+3. **You raised `W` from 0 to 4. What changed in the samples, and what is the cost of a very large `W`?**
+
+   *your answer*
+
+#%% code
+print(f"Auto-graded score: {points} / 90   (+ up to 10 for the written answers; pass mark 70)")

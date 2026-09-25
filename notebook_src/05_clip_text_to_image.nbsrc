@@ -1,0 +1,246 @@
+#%% md
+# Lab 5 · CLIP: from class labels to English prompts
+
+{{BADGE}}
+
+**Time:** about 45 minutes
+
+A one-hot label can only say "class 7". To steer a model with *language* we need a vector that captures meaning. **CLIP** (Contrastive Language–Image Pretraining) gives us exactly that: an image encoder and a text encoder trained so that a picture and its caption land **close together** in the same 512-dimensional space.
+
+The plan:
+1. get a feel for **CLIP encodings** (similarity, zero-shot classification),
+2. train our diffusion model with the **CLIP image embedding** of each training photo as its context,
+3. at sampling time, swap in the **CLIP text embedding** of a prompt. The model never saw a caption, yet it follows text.
+
+#%% setup
+
+#%% code
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+from diffusion_workshop.clip_utils import ClipEncoder, CLIP_DIM
+from diffusion_workshop.data import get_photo_paths, load_photo
+from diffusion_workshop.ddpm import DDPM, get_context_mask
+from diffusion_workshop.models import UNet, count_parameters
+from diffusion_workshop.viz import show_images, plot_losses
+
+#%% md
+## 1 · Data and CLIP
+
+We use the TensorFlow **flower photos** (3,670 pictures: daisy, dandelion, roses, sunflowers, tulips). The first run downloads about 220 MB.
+
+> If the download is blocked on your network, set `DATASET = "cifar10"` and adapt the prompts further down (e.g. "a photo of a horse").
+
+#%% code
+DATASET = "flowers"
+IMG_SIZE, IMG_CH = 32, 3
+
+paths, labels, class_names = get_photo_paths(DATASET)
+print(len(paths), "photos |", class_names)
+
+clip = ClipEncoder(device)          # downloads the CLIP ViT-B/32 weights on first use
+
+#%% code
+# a few example photos at full resolution
+demo_idx = torch.linspace(0, len(paths) - 1, 5).long().tolist()
+demo_pils = [load_photo(paths[i])[1] for i in demo_idx]
+fig, axes = plt.subplots(1, 5, figsize=(12, 2.6))
+for ax, im, i in zip(axes, demo_pils, demo_idx):
+    ax.imshow(im); ax.set_title(class_names[labels[i]]); ax.axis("off")
+plt.show()
+
+#%% md
+## 2 · CLIP encodings
+
+`clip.encode_images` and `clip.encode_text` both return **unit-length** vectors with 512 numbers each.
+
+### TODO 1 · Cosine similarity
+For unit-length vectors, cosine similarity is just the dot product. Compute the full `(n_images, n_texts)` similarity matrix with one matrix multiplication.
+
+Hint: `A @ B.T`
+
+#%% code
+prompts = [
+    "a round white flower with a yellow center",
+    "a fluffy dandelion seed head",
+    "a deep red rose",
+    "a tall sunflower against the sky",
+    "a bunch of colourful tulips",
+    "a photo of a truck",
+]
+img_emb = clip.encode_images(demo_pils)      # (5, 512)
+txt_emb = clip.encode_text(prompts)          # (6, 512)
+print(tuple(img_emb.shape), tuple(txt_emb.shape), "| length of first vector:", img_emb[0].norm().item())
+
+def cosine_similarity_matrix(a, b):
+    ### BEGIN SOLUTION
+    return a @ b.T
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+sim = cosine_similarity_matrix(img_emb, txt_emb)
+
+#%% code
+# ✅ check + heat-map
+assert tuple(sim.shape) == (5, 6) and torch.allclose(sim[2, 3], (img_emb[2] * txt_emb[3]).sum(), atol=1e-5)
+print("✅ TODO 1 looks good")
+
+plt.figure(figsize=(8, 3.5)); plt.imshow(sim.cpu(), cmap="viridis")
+plt.yticks(range(5), [class_names[labels[i]] for i in demo_idx]); plt.xticks(range(6), [p[:22] + "…" for p in prompts], rotation=30, ha="right")
+plt.colorbar(label="cosine similarity"); plt.title("image (rows) vs. text (columns)"); plt.show()
+
+#%% md
+Each photo should be brightest under the prompt that describes it, and the truck column should be dark everywhere.
+
+### TODO 2 · Zero-shot classification
+CLIP was never trained on this dataset, yet it can classify it: encode one prompt per class, then pick the most similar prompt for every image.
+
+#%% code
+class_prompts = [f"a photo of {name}" for name in class_names]
+class_txt_emb = clip.encode_text(class_prompts)
+
+subset = list(range(0, len(paths), max(len(paths) // 200, 1)))          # about 200 photos
+subset_emb = clip.encode_images([load_photo(paths[i])[1] for i in subset])
+subset_labels = torch.tensor([labels[i] for i in subset], device=device)
+
+### BEGIN SOLUTION
+predicted = cosine_similarity_matrix(subset_emb, class_txt_emb).argmax(dim=1)
+### END SOLUTION
+### STUDENT: predicted = FIXME      # (n_images,) index of the best-matching class prompt for every image
+
+accuracy = (predicted == subset_labels).float().mean().item()
+print(f"zero-shot accuracy on {len(subset)} photos: {accuracy:.1%}")
+
+#%% code
+# ✅ check
+assert predicted.shape == subset_labels.shape
+if not dw.SMOKE:
+    assert accuracy > 0.8, "CLIP should get well above 80% here - check the argmax dimension"
+print("✅ TODO 2 looks good")
+
+#%% md
+## 3 · Pre-compute the training set
+
+For every photo we store (a) the 32×32 tensor that the diffusion model learns to draw and (b) its CLIP **image** embedding, which will be the context. Running CLIP once up front is far cheaper than running it in every training step. This takes a minute or two.
+
+#%% code
+import os
+CACHE = f"clip_{DATASET}_{IMG_SIZE}.pt"
+
+if os.path.exists(CACHE) and not dw.SMOKE:
+    train_x, train_c = torch.load(CACHE)
+else:
+    xs, cs = [], []
+    for start in range(0, len(paths), 256):
+        loaded = [load_photo(p, IMG_SIZE) for p in paths[start:start + 256]]
+        xs.append(torch.stack([x for x, _ in loaded]))
+        cs.append(clip.encode_images([pil for _, pil in loaded]).cpu())
+        print(f"\rencoded {min(start + 256, len(paths))}/{len(paths)}", end="")
+    train_x, train_c = torch.cat(xs), torch.cat(cs)
+    torch.save((train_x, train_c), CACHE)
+
+print("\nimages:", tuple(train_x.shape), "| contexts:", tuple(train_c.shape))
+loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_c),
+                                     batch_size=pick(128, smoke=8), shuffle=True, drop_last=True)
+show_images(train_x[::max(len(train_x) // 16, 1)][:16], suptitle="What the model will learn to draw (32x32)")
+
+#%% md
+## 4 · Train a CLIP-conditioned diffusion model
+
+Same U-Net, same Bernoulli mask, same loss as Lab 4. Only two numbers change: the context is 512-dimensional instead of 10, and the images are 32×32 RGB.
+
+This dataset is small, so we need many epochs (each one is only about 28 batches).
+
+> **Instructors:** to save workshop time, train once beforehand, upload the saved `clip_unet.pt`, and point `CHECKPOINT` at it.
+
+#%% code
+T = pick(300, smoke=10)
+ddpm = DDPM(T=T, device=device)
+model = UNet(T, img_ch=IMG_CH, img_size=IMG_SIZE, down_chs=pick((128, 256, 256), smoke=(32, 32, 32)),
+             c_embed_dim=CLIP_DIM).to(device)
+print(f"{count_parameters(model):,} trainable parameters")
+
+CHECKPOINT = None            # a local path or an https:// URL of a saved state_dict, or None to train here
+EPOCHS = pick(80, smoke=1)
+DROP_PROB = 0.1
+
+#%% code
+if CHECKPOINT:
+    state = (torch.hub.load_state_dict_from_url(CHECKPOINT, map_location=device)
+             if CHECKPOINT.startswith("http") else torch.load(CHECKPOINT, map_location=device))
+    model.load_state_dict(state)
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    losses = []
+    model.train()
+    for epoch in range(EPOCHS):
+        for x_0, c in loader:
+            x_0, c = x_0.to(device), c.to(device)
+            if torch.rand(()) < 0.5:
+                x_0 = x_0.flip(-1)                       # cheap augmentation: mirror the batch
+            t = torch.randint(0, T, (x_0.shape[0],), device=device)
+            loss = ddpm.get_loss(model, x_0, t, c, get_context_mask(c, DROP_PROB))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+        if (epoch + 1) % 10 == 0 or epoch == EPOCHS - 1:
+            print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-50:]) / len(losses[-50:]):.4f}")
+    torch.save(model.state_dict(), "clip_unet.pt")
+    plot_losses(losses, "Text-to-image model loss", window=20)
+
+#%% md
+## 5 · Text to image
+
+### TODO 3 · Write `text_to_image`
+1. encode the prompts with CLIP's **text** encoder,
+2. hand the embeddings to `ddpm.sample_w(model, c, img_shape, w)` as the context.
+
+#%% code
+def text_to_image(prompts, w=2.0):
+    ### BEGIN SOLUTION
+    c = clip.encode_text(prompts)
+    return ddpm.sample_w(model, c, (IMG_CH, IMG_SIZE, IMG_SIZE), w=w)
+    ### END SOLUTION
+    ### STUDENT: c = FIXME
+    ### STUDENT: return ddpm.sample_w(model, FIXME, (IMG_CH, IMG_SIZE, IMG_SIZE), w=w)
+
+my_prompts = [
+    "a round white daisy with a yellow center",
+    "a deep red rose",
+    "a bright yellow sunflower",
+    "a pink tulip",
+]
+images = text_to_image([p for p in my_prompts for _ in range(4)], w=2.0)
+show_images(images, titles=[p[:24] for p in my_prompts for _ in range(4)], ncols=4, scale=1.8)
+
+#%% code
+# ✅ check
+assert tuple(images.shape) == (16, IMG_CH, IMG_SIZE, IMG_SIZE)
+print("✅ TODO 3 looks good: you have built a text-to-image model")
+
+#%% md
+## 6 · Does it listen? Let CLIP be the judge
+
+We can close the loop: encode the *generated* images with CLIP and check which prompt each one is most similar to.
+
+#%% code
+from torchvision.transforms.functional import to_pil_image
+
+gen_pils = [to_pil_image((img.clamp(-1, 1) + 1) / 2).resize((224, 224)) for img in images.cpu()]
+score = cosine_similarity_matrix(clip.encode_images(gen_pils), clip.encode_text(my_prompts))
+hits = (score.argmax(1).cpu() == torch.arange(len(my_prompts)).repeat_interleave(4)).float().mean()
+print(f"{hits:.0%} of the generated images are closest to the prompt that produced them")
+
+#%% md
+## What to notice
+
+* At 32×32 these are impressionist blobs of colour, but the **colours and rough shapes follow the text**, even though the model never saw a caption during training.
+* Try guidance weights `w = 0, 1, 2, 4`: the same diversity-versus-fidelity trade-off as in Lab 4.
+* Production systems such as Stable Diffusion use this recipe with three upgrades: a far larger U-Net with attention, diffusion in a compressed **latent** space instead of on pixels, and billions of image–caption pairs.
+
+### If you have time
+1. Write prompts for things that are **not** in the training data ("a blue flower", "a flower at night"). What does the model do?
+2. **Image variations:** use `clip.encode_images([...])` of a training photo as the context instead of text.
+3. **Prompt arithmetic:** normalize `encode_text(["a rose"]) + encode_text(["yellow"])` and sample from it.
+4. There is a known *modality gap*: CLIP's image vectors and text vectors occupy slightly different regions of the space. One remedy is to add a little Gaussian noise to `c` during training (`c + 0.05 * torch.randn_like(c)`, then re-normalize). Does it make the model follow prompts better?

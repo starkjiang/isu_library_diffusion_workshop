@@ -1,0 +1,215 @@
+#%% md
+# Lab 4 · Classifier-free diffusion guidance: choose what gets generated
+
+{{BADGE}}
+
+**Time:** about 40 minutes
+
+Yesterday's model paints *some* piece of clothing. Today we tell it **which one**.
+
+1. Give the U-Net a **context** input: the class label as a one-hot vector, passed through an embedding.
+2. During training, randomly **drop** the context with a **Bernoulli mask**, so one network learns both "draw a sneaker" and "draw anything".
+3. At sampling time, run both modes and **push the prediction away from "anything" towards "sneaker"**. The size of the push is the guidance weight `w`.
+
+#%% setup
+
+#%% code
+import torch.nn.functional as F
+
+from diffusion_workshop.data import get_fashion_mnist, FASHION_LABELS
+from diffusion_workshop.ddpm import DDPM
+from diffusion_workshop.models import UNet, count_parameters
+from diffusion_workshop.viz import show_images, plot_losses, animate
+
+IMG_SIZE, IMG_CH, N_CLASSES = 16, 1, 10
+T = pick(300, smoke=20)
+dataset, loader = get_fashion_mnist(img_size=IMG_SIZE, batch_size=128)
+ddpm = DDPM(T=T, device=device)
+print({i: name for i, name in enumerate(FASHION_LABELS)})
+
+#%% md
+## 1 · Labels as context vectors
+
+A label such as `7` (sneaker) becomes a **one-hot** vector: ten zeros with a single 1 at position 7.
+
+### TODO 1 · One-hot encode the labels
+Hint: `F.one_hot(labels, num_classes)` returns integers; the network needs `.float()`.
+
+#%% code
+def to_context(labels):
+    ### BEGIN SOLUTION
+    return F.one_hot(labels, N_CLASSES).float()
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+print(to_context(torch.tensor([7, 0])))
+
+#%% code
+# ✅ check
+_c = to_context(torch.tensor([7, 0, 3]))
+assert _c.dtype == torch.float32 and tuple(_c.shape) == (3, 10) and _c[0, 7] == 1 and _c.sum() == 3
+print("✅ TODO 1 looks good")
+
+#%% md
+## 2 · How the U-Net uses the context
+
+We use the improved U-Net from Lab 3 (now in `diffusion_workshop/models.py`) with two extra `EmbedBlock`s for the context. Inside `forward`:
+
+```python
+c = c * c_mask                                   # a 0 in the mask wipes that sample's context
+up1 = self.up1(c_emb1 * up0 + t_emb1, down2)     # context SCALES the features, time SHIFTS them
+up2 = self.up2(c_emb2 * up1 + t_emb2, down1)
+```
+
+#%% code
+model = UNet(T, img_ch=IMG_CH, img_size=IMG_SIZE, down_chs=(64, 64, 128), c_embed_dim=N_CLASSES).to(device)
+print(f"{count_parameters(model):,} trainable parameters")
+
+#%% md
+## 3 · The Bernoulli mask
+
+A Bernoulli draw is a biased coin flip: 1 with probability *p*, otherwise 0.
+For each sample in the batch we flip one coin: **1 = keep** the context, **0 = drop** it. Dropping about 10% of the time is typical.
+
+### TODO 2 · Write `get_context_mask`
+Return a `(B, 1)` tensor of 0s and 1s in which each entry is 1 with probability `1 - drop_prob`.
+
+Hint: `torch.bernoulli(p)` flips one coin for every entry of the tensor `p`.
+
+#%% code
+def get_context_mask(c, drop_prob):
+    keep_prob = torch.full((c.shape[0], 1), 1.0 - drop_prob, device=c.device)
+    ### BEGIN SOLUTION
+    return torch.bernoulli(keep_prob)
+    ### END SOLUTION
+    ### STUDENT: return FIXME
+
+#%% code
+# ✅ check
+_m = get_context_mask(torch.zeros(10_000, 10), drop_prob=0.1)
+assert tuple(_m.shape) == (10_000, 1) and set(_m.unique().tolist()) <= {0.0, 1.0}
+assert 0.88 < _m.mean() < 0.92, f"about 90% should be kept, got {_m.mean():.2%}"
+print(f"✅ TODO 2 looks good ({_m.mean():.1%} kept)")
+
+#%% md
+## 4 · Train with context dropout
+
+### TODO 3 · Complete the training step
+`ddpm.get_loss(model, x_0, t, *model_args)` passes any extra arguments straight to the model, which expects `(x_t, t, c, c_mask)`.
+
+#%% code
+EPOCHS = pick(6, smoke=1)
+DROP_PROB = 0.1
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+
+model.train()
+for epoch in range(EPOCHS):
+    for x_0, labels in loader:
+        x_0, labels = x_0.to(device), labels.to(device)
+        t = torch.randint(0, T, (x_0.shape[0],), device=device)
+        ### BEGIN SOLUTION
+        c = to_context(labels)
+        c_mask = get_context_mask(c, DROP_PROB)
+        loss = ddpm.get_loss(model, x_0, t, c, c_mask)
+        ### END SOLUTION
+        ### STUDENT: c = FIXME                    # one-hot context
+        ### STUDENT: c_mask = FIXME               # Bernoulli mask
+        ### STUDENT: loss = ddpm.get_loss(model, x_0, t, FIXME, FIXME)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-100:]) / len(losses[-100:]):.4f}")
+
+plot_losses(losses, "Loss with context")
+
+#%% md
+## 5 · Guided sampling
+
+At every reverse step we ask the model twice:
+
+* ε<sub>keep</sub>: "what is the noise, given that this is a **sneaker**?"
+* ε<sub>drop</sub>: "what is the noise, given **no information**?"
+
+and combine them:
+
+$$\hat\varepsilon = (1 + w)\,\varepsilon_{\text{keep}} \;-\; w\,\varepsilon_{\text{drop}}$$
+
+`w = -1` ignores the label, `w = 0` is plain conditional sampling, and `w > 0` exaggerates whatever makes a sneaker different from "anything".
+
+### TODO 4 · Combine the two predictions
+
+#%% code
+@torch.no_grad()
+def sample_w(model, c, w, keep_every=None):
+    """c: (N, N_CLASSES) one context row per image to generate."""
+    model.eval()
+    n = c.shape[0]
+    x_t = torch.randn(n, IMG_CH, IMG_SIZE, IMG_SIZE, device=device)
+
+    c_double = c.repeat(2, 1)                           # run every image twice in one batch:
+    c_mask = torch.ones(2 * n, 1, device=device)        #   first half keeps its context,
+    c_mask[n:] = 0.0                                    #   second half has it dropped
+
+    frames = []
+    for t in range(T - 1, -1, -1):
+        t_batch = torch.full((2 * n,), t, device=device, dtype=torch.long)
+        e = model(x_t.repeat(2, 1, 1, 1), t_batch, c_double, c_mask)
+        e_keep, e_drop = e[:n], e[n:]
+        ### BEGIN SOLUTION
+        e_t = (1 + w) * e_keep - w * e_drop
+        ### END SOLUTION
+        ### STUDENT: e_t = FIXME
+        x_t = ddpm.reverse_q(x_t, t, e_t)
+        if keep_every and t % keep_every == 0:
+            frames.append(x_t.cpu())
+    model.train()
+    return x_t, frames
+
+#%% code
+# ✅ check against the reference sampler (same random seed -> same images)
+_c = to_context(torch.arange(4, device=device))
+torch.manual_seed(1); _mine, _ = sample_w(model, _c, w=1.5)
+torch.manual_seed(1); _ref = ddpm.sample_w(model, _c, (IMG_CH, IMG_SIZE, IMG_SIZE), w=1.5)
+assert torch.allclose(_mine, _ref, atol=1e-4), "e_t does not match (1 + w) * e_keep - w * e_drop"
+print("✅ TODO 4 looks good")
+
+#%% md
+## 6 · What does `w` do?
+
+One row per guidance weight, one column per class.
+
+#%% code
+WS = [-1.0, 0.0, 0.5, 1.0, 2.0, 4.0]
+c_all = to_context(torch.arange(N_CLASSES, device=device))
+
+rows = []
+for w in WS:
+    dw.seed_everything(0)                      # same starting noise in every row
+    rows.append(sample_w(model, c_all, w)[0].cpu())
+
+from diffusion_workshop.viz import show_rows
+show_rows(rows, [f"w = {w}" for w in WS], ncols=N_CLASSES)
+print("columns:", FASHION_LABELS)
+
+#%% md
+**What to notice**
+* `w = -1`: the label is ignored, and the columns show random items.
+* `w = 0`: mostly the right class, sometimes vague.
+* `w = 1 … 2`: crisp and on-class. This is the usual sweet spot.
+* large `w`: over-saturated, high-contrast, and less varied. Guidance trades **diversity** for **fidelity**.
+
+#%% code
+# Your turn: design an outfit
+wanted = ["Sneaker", "Trouser", "Coat", "Bag"]
+c = to_context(torch.tensor([FASHION_LABELS.index(name) for name in wanted], device=device)).repeat_interleave(4, dim=0)
+imgs, frames = sample_w(model, c, w=1.5, keep_every=max(T // 30, 1))
+show_images(imgs, titles=[n for n in wanted for _ in range(4)], ncols=4)
+
+#%% md
+### If you have time
+1. **Blend two classes:** build a context with 0.5 at "Sneaker" and 0.5 at "Ankle boot". What do you get?
+2. Retrain with `DROP_PROB = 0.0`. Does guidance (`w > 0`) still help? Why not?
+3. Retrain with `DROP_PROB = 0.5`. What is the trade-off?
+4. For a fixed class, generate 16 samples at `w = 0` and 16 at `w = 4`. Which set has more variety?

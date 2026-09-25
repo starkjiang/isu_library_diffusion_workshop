@@ -1,0 +1,274 @@
+#%% md
+# Lab 3 · Optimizations: four upgrades that sharpen the images
+
+{{BADGE}}
+
+**Time:** about 35 minutes
+
+The diffusion process from Lab 2 stays exactly the same. We only improve the **U-Net**:
+
+| # | Upgrade | Replaces | Why |
+|---|---|---|---|
+| 1 | **Group Normalization** | BatchNorm | statistics no longer depend on which other images share the batch |
+| 2 | **GELU** | ReLU | a smooth activation with no "dead" neurons |
+| 3 | **Rearrange pooling** | MaxPool | shrinks the image without throwing 75% of the pixels away |
+| 4 | **Sinusoidal position embeddings** | `t / T` | gives the network a rich, unambiguous description of the timestep |
+
+#%% setup
+
+#%% code
+import math
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from einops.layers.torch import Rearrange
+
+from diffusion_workshop.data import get_fashion_mnist
+from diffusion_workshop.ddpm import DDPM                 # the q / reverse_q you wrote in Lab 2, packaged
+from diffusion_workshop.viz import show_images, plot_losses, animate
+
+IMG_SIZE, IMG_CH = 16, 1
+T = pick(300, smoke=20)
+dataset, loader = get_fashion_mnist(img_size=IMG_SIZE, batch_size=128)
+ddpm = DDPM(T=T, device=device)
+
+#%% md
+## 1 + 2 · Group Normalization and GELU
+
+**BatchNorm** normalizes each channel using the mean and variance of the *whole batch*. In diffusion, one batch mixes nearly-clean and nearly-pure-noise images, so those batch statistics are unstable, and they behave differently again at sampling time.
+**GroupNorm** normalizes groups of channels *within each single image*. No dependence on the batch.
+
+**ReLU** outputs exactly zero for every negative input; a neuron stuck there gets zero gradient and stops learning. **GELU** is a smooth curve that lets a little negative signal through.
+
+#%% code
+xs = torch.linspace(-4, 4, 200)
+plt.figure(figsize=(5, 3))
+plt.plot(xs, F.relu(xs), label="ReLU"); plt.plot(xs, F.gelu(xs), label="GELU")
+plt.axhline(0, color="gray", lw=0.5); plt.legend(); plt.title("Activation functions"); plt.show()
+
+#%% md
+### TODO 1 · Build the new conv block
+
+Conv 3×3 → `nn.GroupNorm(n_groups, out_ch)` → `nn.GELU()`.
+
+Note the argument order of `nn.GroupNorm`: **number of groups first**, then number of channels. The channels must be divisible by the groups.
+
+#%% code
+class GELUConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, n_groups):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            ### BEGIN SOLUTION
+            nn.GroupNorm(n_groups, out_ch),
+            nn.GELU(),
+            ### END SOLUTION
+            ### STUDENT: FIXME,    # group normalization
+            ### STUDENT: FIXME,    # GELU activation
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+#%% code
+# ✅ check
+_blk = GELUConvBlock(1, 32, 8)
+_kinds = [type(m) for m in _blk.model]
+assert _kinds == [nn.Conv2d, nn.GroupNorm, nn.GELU], f"layers are {_kinds}"
+assert _blk.model[1].num_groups == 8 and tuple(_blk(torch.randn(2, 1, 16, 16)).shape) == (2, 32, 16, 16)
+print("✅ TODO 1 looks good")
+
+#%% md
+## 3 · Rearrange pooling
+
+Max pooling keeps 1 pixel of every 2×2 patch and discards the other 3. Instead we can **move** all four pixels into the channel axis (C → 4C) and let a convolution *learn* how to combine them.
+
+`einops` describes the move with a pattern string. Watch what it does to a tiny 4×4 image:
+
+#%% code
+tiny = torch.arange(16.).view(1, 1, 4, 4)
+print("input (1 channel, 4x4):\n", tiny[0, 0])
+moved = Rearrange("b c (h p1) (w p2) -> b (c p1 p2) h w", p1=2, p2=2)(tiny)
+print("\nafter rearrange:", tuple(moved.shape), " -> 4 channels of 2x2, nothing lost")
+print(moved[0])
+
+#%% md
+### TODO 2 · Write the rearrange-pool block
+
+1. rearrange with the pattern above (`p1 = p2 = 2`),
+2. a `GELUConvBlock` that maps the `4 * in_ch` channels back to `in_ch`.
+
+#%% code
+class RearrangePoolBlock(nn.Module):
+    def __init__(self, in_ch, n_groups):
+        super().__init__()
+        ### BEGIN SOLUTION
+        self.rearrange = Rearrange("b c (h p1) (w p2) -> b (c p1 p2) h w", p1=2, p2=2)
+        self.conv = GELUConvBlock(4 * in_ch, in_ch, n_groups)
+        ### END SOLUTION
+        ### STUDENT: self.rearrange = Rearrange(FIXME, p1=2, p2=2)
+        ### STUDENT: self.conv = GELUConvBlock(FIXME, FIXME, n_groups)
+
+    def forward(self, x):
+        return self.conv(self.rearrange(x))
+
+#%% code
+# ✅ check
+assert tuple(RearrangePoolBlock(32, 8)(torch.randn(2, 32, 16, 16)).shape) == (2, 32, 8, 8)
+print("✅ TODO 2 looks good: half the size, same channels")
+
+#%% md
+## 4 · Sinusoidal position embeddings
+
+In Lab 2 the network saw the time as one number, `t / T`. Neighbouring timesteps are then almost indistinguishable (0.500 vs 0.503).
+
+Borrowing from Transformers, we describe `t` with many sine and cosine waves of different frequencies. Fast waves separate neighbouring steps; slow waves tell early from late.
+
+$$\text{emb}(t) = \big[\sin(t\,\omega_1), \dots, \sin(t\,\omega_{d/2}),\; \cos(t\,\omega_1), \dots, \cos(t\,\omega_{d/2})\big]$$
+
+### TODO 3 · Finish the embedding
+
+`args` has shape `(B, dim/2)`. Return the sines and cosines concatenated along the last axis → `(B, dim)`.
+
+#%% code
+class SinusoidalPositionEmbedBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=time.device) / (half - 1))
+        args = time.float()[:, None] * freqs[None, :]          # (B, half)
+        ### BEGIN SOLUTION
+        return torch.cat((args.sin(), args.cos()), dim=-1)
+        ### END SOLUTION
+        ### STUDENT: return FIXME
+
+#%% code
+# ✅ check + picture
+_emb = SinusoidalPositionEmbedBlock(32)(torch.arange(T))
+assert tuple(_emb.shape) == (T, 32) and torch.allclose(_emb[0, :16], torch.zeros(16)) and torch.allclose(_emb[0, 16:], torch.ones(16))
+print("✅ TODO 3 looks good")
+plt.figure(figsize=(7, 2.5)); plt.imshow(_emb.T, aspect="auto", cmap="RdBu")
+plt.xlabel("timestep t"); plt.ylabel("embedding dim"); plt.title("Every timestep gets its own fingerprint"); plt.show()
+
+#%% md
+## 5 · Assemble the improved U-Net
+
+Nothing to fill in here. Read through it and find where each of your blocks is used.
+One extra ingredient: a **residual** first block (`out = conv1(x) + conv2(conv1(x))`), which keeps gradients flowing.
+
+#%% code
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, n_groups):
+        super().__init__()
+        self.conv1 = GELUConvBlock(in_ch, out_ch, n_groups)
+        self.conv2 = GELUConvBlock(out_ch, out_ch, n_groups)
+    def forward(self, x):
+        x1 = self.conv1(x)
+        return x1 + self.conv2(x1)
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, n_groups):
+        super().__init__()
+        self.model = nn.Sequential(GELUConvBlock(in_ch, out_ch, n_groups),
+                                   GELUConvBlock(out_ch, out_ch, n_groups),
+                                   RearrangePoolBlock(out_ch, n_groups))            # <- upgrade 3
+    def forward(self, x):
+        return self.model(x)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, n_groups):
+        super().__init__()
+        self.model = nn.Sequential(nn.ConvTranspose2d(2 * in_ch, out_ch, 2, 2),
+                                   GELUConvBlock(out_ch, out_ch, n_groups),
+                                   GELUConvBlock(out_ch, out_ch, n_groups),
+                                   GELUConvBlock(out_ch, out_ch, n_groups))
+    def forward(self, x, skip):
+        return self.model(torch.cat((x, skip), dim=1))
+
+class EmbedBlock(nn.Module):
+    def __init__(self, input_dim, emb_dim):
+        super().__init__()
+        self.input_dim = input_dim
+        self.model = nn.Sequential(nn.Linear(input_dim, emb_dim), nn.GELU(),
+                                   nn.Linear(emb_dim, emb_dim), nn.Unflatten(1, (emb_dim, 1, 1)))
+    def forward(self, x):
+        return self.model(x.view(-1, self.input_dim))
+
+class BetterUNet(nn.Module):
+    def __init__(self, T, img_ch=IMG_CH, img_size=IMG_SIZE, chs=(64, 64, 128), t_dim=8):
+        super().__init__()
+        c0, c1, c2 = chs
+        latent = img_size // 4
+        self.down0 = ResidualConvBlock(img_ch, c0, 8)
+        self.down1 = DownBlock(c0, c1, 32)
+        self.down2 = DownBlock(c1, c2, 32)
+        self.to_vec = nn.Sequential(nn.Flatten(), nn.GELU())
+        self.dense = nn.Sequential(nn.Linear(c2 * latent**2, c1), nn.GELU(),
+                                   nn.Linear(c1, c1), nn.GELU(),
+                                   nn.Linear(c1, c2 * latent**2), nn.GELU())
+        self.sinusoidal_time = SinusoidalPositionEmbedBlock(t_dim)                  # <- upgrade 4
+        self.t_emb1 = EmbedBlock(t_dim, c2)
+        self.t_emb2 = EmbedBlock(t_dim, c1)
+        self.up0 = nn.Sequential(nn.Unflatten(1, (c2, latent, latent)), GELUConvBlock(c2, c2, 32))
+        self.up1 = UpBlock(c2, c1, 32)
+        self.up2 = UpBlock(c1, c0, 32)
+        self.out = nn.Sequential(nn.Conv2d(2 * c0, c0, 3, 1, 1), nn.GroupNorm(8, c0), nn.GELU(),
+                                 nn.Conv2d(c0, img_ch, 3, 1, 1))
+
+    def forward(self, x, t):
+        down0 = self.down0(x)
+        down1 = self.down1(down0)
+        down2 = self.down2(down1)
+        up0 = self.up0(self.dense(self.to_vec(down2)))
+        t = self.sinusoidal_time(t)
+        up1 = self.up1(up0 + self.t_emb1(t), down2)
+        up2 = self.up2(up1 + self.t_emb2(t), down1)
+        return self.out(torch.cat((up2, down0), dim=1))
+
+model = BetterUNet(T).to(device)
+print(f"{sum(p.numel() for p in model.parameters()):,} trainable parameters")
+
+#%% md
+## 6 · Train and sample
+
+`ddpm.get_loss` and `ddpm.sample` are the functions you wrote in Lab 2, moved into `diffusion_workshop/ddpm.py`. Open that file if you want to confirm there is no magic in it.
+
+#%% code
+EPOCHS = pick(5, smoke=1)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+losses = []
+
+model.train()
+for epoch in range(EPOCHS):
+    for x_0, _ in loader:
+        x_0 = x_0.to(device)
+        t = torch.randint(0, T, (x_0.shape[0],), device=device)
+        loss = ddpm.get_loss(model, x_0, t)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    print(f"epoch {epoch + 1}/{EPOCHS}   loss {sum(losses[-100:]) / len(losses[-100:]):.4f}")
+
+plot_losses(losses, "Noise-prediction loss (improved U-Net)")
+
+#%% code
+generated, frames = ddpm.sample(model, (16, IMG_CH, IMG_SIZE, IMG_SIZE), keep_every=max(T // 30, 1))
+show_images(generated, suptitle="Generated with the improved U-Net")
+animate([f[0] for f in frames])
+
+#%% md
+## What to notice
+
+* Put these next to your Lab 2 samples: cleaner backgrounds, fewer speckles, more recognizable clothing.
+* Compare the final loss values of Lab 2 and Lab 3.
+* We still cannot **choose** what gets generated: a shoe or a shirt is down to luck. That is tomorrow's first topic.
+
+### If you have time: an ablation
+Swap **one** upgrade back out, retrain, and compare. Which one matters most here?
+1. In `GELUConvBlock`, replace `nn.GroupNorm(n_groups, out_ch)` with `nn.BatchNorm2d(out_ch)`.
+2. In `DownBlock`, replace `RearrangePoolBlock(out_ch, n_groups)` with `nn.MaxPool2d(2)`.
+3. In `BetterUNet.forward`, replace the sinusoidal embedding with `t.float()[:, None] / self.T` (and set the `EmbedBlock` input size to 1).

@@ -1,0 +1,13 @@
+# Google Colab already ships torch, torchvision, matplotlib, transformers and Pillow.
+# Only `einops` has to be installed there (the notebooks do it for you).
+torch>=2.1
+torchvision>=0.16
+einops>=0.7
+matplotlib>=3.7
+numpy
+pillow
+transformers>=4.35
+# instructor tooling
+nbformat>=5.9
+nbclient>=0.9
+ipykernel

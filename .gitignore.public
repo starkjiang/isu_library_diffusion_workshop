@@ -1,0 +1,4 @@
+# Append these lines to .gitignore in the copy of the repository that students can see.
+solutions/
+instructor/
+tools/make_quiz.py
